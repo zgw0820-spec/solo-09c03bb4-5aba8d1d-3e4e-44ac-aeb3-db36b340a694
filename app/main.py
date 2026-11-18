@@ -8,10 +8,17 @@
 - 懒过期：expires_at <= now 即视为过期，地址立即可回收分配给其它虚拟机，无需后台清理线程。
 - 令牌保护：续租/释放必须携带租约令牌；地址易主后，旧令牌迟到的续租/释放不影响新归属。
 - 同一虚拟机在任意时刻只能持有一个有效（未释放且未过期）地址。
+- 网卡占用快照对账：提交递增序号 + 占用列表，对账列出仍占用已结束租约地址的虚拟机、
+  同一地址多机占用、与有效租约不符的归属。对账只读租约台账，不改写任何租约。
+- 快照即事实：过期/已释放地址只要仍出现在最新已提交快照中，就不会被再次分配，
+  直到更新的快照确认其空闲。快照与申请在同一 BEGIN IMMEDIATE 事务体系内串行化，
+  分配与对账永远基于一致的已提交状态；快照序号持久化，重启后继续使用最后成功提交的序号。
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import os
 import secrets
 import sqlite3
@@ -23,7 +30,7 @@ from typing import Any, Iterator, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ---------------- 配置（环境变量） ----------------
 
@@ -74,6 +81,26 @@ CREATE TABLE IF NOT EXISTS request_log (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_request_log_req ON request_log(request_id);
+
+-- 虚拟化平台网卡占用快照（整份快照按递增序号提交，全部写操作与租约共用同一写事务体系）
+CREATE TABLE IF NOT EXISTS snapshots (
+    seq            INTEGER PRIMARY KEY,   -- 递增序号（单调递增，由提交方保证）
+    content_hash   TEXT NOT NULL,         -- 规范化占用列表的哈希：同序号同内容幂等、同序号异内容冲突
+    entry_count    INTEGER NOT NULL,
+    committed_at   REAL NOT NULL,
+    committed_node TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_entries (
+    seq       INTEGER NOT NULL,           -- 所属快照序号
+    vm_id     TEXT NOT NULL,             -- 占用该地址的虚拟机 ID
+    address   TEXT NOT NULL,             -- 池内 IPv4 地址
+    ord       INTEGER NOT NULL,          -- 提交时的原始顺序
+    PRIMARY KEY (seq, vm_id, address),
+    FOREIGN KEY (seq) REFERENCES snapshots(seq)
+);
+CREATE INDEX IF NOT EXISTS idx_snap_entries_seq ON snapshot_entries(seq);
+CREATE INDEX IF NOT EXISTS idx_snap_entries_addr ON snapshot_entries(seq, address);
 """
 
 
@@ -182,11 +209,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="机房虚拟机地址租约服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "内网 IPv4 地址池租约 API。申请幂等（同申请号重试返回原租约当前状态）；"
         "同一虚拟机仅可持有一个有效地址；过期地址可回收再分配；"
         "续租/释放需携带租约令牌，旧令牌不影响新归属。"
+        "新增网卡占用快照对账：递增序号提交整份占用，同序号同内容幂等、异内容或旧序号拒绝；"
+        "快照中仍占用的已结束租约地址不会被再次分配，直到新快照确认空闲。"
     ),
     lifespan=lifespan,
 )
@@ -215,6 +244,195 @@ class RenewIn(BaseModel):
 
 class ReleaseIn(BaseModel):
     token: str = Field(min_length=1, max_length=128, description="申请时返回的租约令牌")
+
+
+# ---------------- 网卡占用快照 ----------------
+
+class SnapshotEntryIn(BaseModel):
+    """快照中的一条网卡占用：虚拟机 ID + 池内 IPv4。"""
+
+    vm_id: str = Field(min_length=1, max_length=128, description="占用该地址的虚拟机 ID",
+                       examples=["vm-1001"])
+    address: str = Field(min_length=1, max_length=64,
+                         description="池内 IPv4 地址（须属于配置的地址池）", examples=["10.99.0.1"])
+
+
+class SnapshotIn(BaseModel):
+    """机房运维提交的整份网卡占用快照：递增序号 + 全量占用列表。"""
+
+    seq: int = Field(ge=1, description="递增序号：只接受比已提交序号更大的值；同序号同内容幂等",
+                     examples=[1])
+    entries: list[SnapshotEntryIn] = Field(
+        description="整份占用列表（全量，非增量）；同一地址出现多次即表示多机占用",
+        examples=[[{"vm_id": "vm-1001", "address": "10.99.0.1"}]])
+
+    @model_validator(mode="after")
+    def _validate_addresses(self) -> "SnapshotIn":
+        bad = sorted({e.address for e in self.entries if e.address not in POOL_ADDRESSES})
+        if bad:
+            raise ValueError(f"地址不在地址池 {POOL_CIDR} 内：{', '.join(bad)}")
+        return self
+
+
+def _canonical_entries(entries: list[SnapshotEntryIn]) -> list[tuple[str, str]]:
+    """规范化为去重后的 (vm_id, address) 列表（按原始顺序去重，保持提交顺序）。
+
+    完全重复的 (vm, address) 对视为幂等重复；同一地址被不同虚拟机占用则保留，
+    作为“同一地址多机占用”在对账中报告。
+    """
+    seen: set[tuple[str, str]] = set()
+    ordered: list[tuple[str, str]] = []
+    for e in entries:
+        pair = (e.vm_id, e.address)
+        if pair not in seen:
+            seen.add(pair)
+            ordered.append(pair)
+    return ordered
+
+
+def _content_hash(pairs: list[tuple[str, str]]) -> str:
+    payload = json.dumps(pairs, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _latest_snapshot_meta(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM snapshots ORDER BY seq DESC LIMIT 1").fetchone()
+
+
+def _reconcile(conn: sqlite3.Connection, now: Optional[float] = None) -> dict[str, Any]:
+    """基于最新已提交快照与租约台账计算对账结果（纯读，不改写任何租约）。
+
+    三类差异：
+    - stale_lease_occupancy：地址的最新租约已结束（过期/释放），但快照中仍有虚拟机占用；
+    - duplicate_occupancy：同一地址在快照中被多台虚拟机占用；
+    - unexpected_occupancy：快照占用与有效租约不符（无有效租约 / 归属虚拟机不同）。
+    另附 missing_from_snapshot：有效租约在租但未出现在快照中（快照漏报）。
+    """
+    now = time.time() if now is None else now
+    meta = _latest_snapshot_meta(conn)
+    if meta is None:
+        return {
+            "snapshot_seq": None,
+            "committed_at": None,
+            "summary": {"entries": 0, "stale_lease_occupancy": 0, "duplicate_occupancy": 0,
+                        "unexpected_occupancy": 0, "consistent": 0, "missing_from_snapshot": 0},
+            "stale_lease_occupancy": [],
+            "duplicate_occupancy": [],
+            "unexpected_occupancy": [],
+            "consistent": [],
+            "missing_from_snapshot": [],
+        }
+    seq = meta["seq"]
+    rows = conn.execute(
+        "SELECT vm_id, address FROM snapshot_entries WHERE seq = ? ORDER BY ord", (seq,)).fetchall()
+
+    # 地址 -> 快照中的占用虚拟机列表（保留重复占用）
+    occupiers: dict[str, list[str]] = {}
+    for r in rows:
+        occupiers.setdefault(r["address"], []).append(r["vm_id"])
+
+    # 一次性取相关地址的租约历史（按地址分组，签发时间倒序），避免逐条查询
+    addresses = sorted(occupiers)
+    placeholders = ",".join("?" for _ in addresses)
+    lease_rows: list[sqlite3.Row] = []
+    if addresses:
+        lease_rows = conn.execute(
+            f"SELECT * FROM leases WHERE address IN ({placeholders}) ORDER BY issued_at DESC, lease_id DESC",
+            addresses).fetchall()
+    history: dict[str, list[sqlite3.Row]] = {}
+    for lr in lease_rows:
+        history.setdefault(lr["address"], []).append(lr)
+
+    stale: list[dict[str, Any]] = []
+    duplicate: list[dict[str, Any]] = []
+    unexpected: list[dict[str, Any]] = []
+    consistent: list[dict[str, Any]] = []
+
+    for addr, vms in occupiers.items():
+        hist = history.get(addr, [])
+        latest = hist[0] if hist else None
+        latest_view = _lease_view(latest, now) if latest is not None else None
+        active = latest if (latest is not None and _status_of(latest, now) == "active") else None
+        is_duplicate = len(vms) > 1
+
+        if is_duplicate:
+            duplicate.append({
+                "address": addr,
+                "occupying_vms": vms,
+                "active_lease": _lease_view(active, now) if active is not None else None,
+                "latest_lease": latest_view,
+                "message": f"地址 {addr} 在快照 #{seq} 中被 {len(vms)} 台虚拟机同时占用",
+            })
+
+        for vm in vms:
+            entry = {"address": addr, "vm_id": vm}
+            if latest is not None and _status_of(latest, now) != "active":
+                stale.append({
+                    **entry,
+                    "ended_lease": latest_view,
+                    "ended_reason": _status_of(latest, now),
+                    "message": (f"虚拟机 {vm} 仍占用地址 {addr}，但该地址的最新租约"
+                                f"（{latest['lease_id']}）已{_status_of(latest, now)}，"
+                                "在新快照确认空闲前不得再次分配"),
+                })
+            elif active is None:
+                unexpected.append({
+                    **entry,
+                    "reason": "no_active_lease",
+                    "active_lease": None,
+                    "latest_lease": latest_view,
+                    "message": f"虚拟机 {vm} 占用地址 {addr}，但台账上该地址无有效租约",
+                })
+            elif active["vm_id"] != vm:
+                unexpected.append({
+                    **entry,
+                    "reason": "vm_mismatch",
+                    "active_lease": _lease_view(active, now),
+                    "message": (f"快照显示 {vm} 占用 {addr}，但有效租约归属 {active['vm_id']}"
+                                f"（租约 {active['lease_id']}）"),
+                })
+            elif not is_duplicate:
+                consistent.append({
+                    **entry,
+                    "lease_id": active["lease_id"],
+                    "expires_at": _iso(active["expires_at"]),
+                })
+
+    # 反向核对：有效租约在租、但未出现在快照中的地址（快照漏报）
+    active_rows = conn.execute(
+        "SELECT * FROM leases WHERE released_at IS NULL AND expires_at > ?"
+        " ORDER BY issued_at DESC, lease_id DESC", (now,)).fetchall()
+    # 同一地址理论上至多一条有效租约（分配互斥），这里仍按地址收敛
+    active_by_addr = {r["address"]: r for r in reversed(active_rows)}
+    missing = []
+    for addr, r in active_by_addr.items():
+        if addr not in occupiers:
+            missing.append({
+                "address": addr,
+                "vm_id": r["vm_id"],
+                "lease_id": r["lease_id"],
+                "expires_at": _iso(r["expires_at"]),
+                "message": f"有效租约显示 {r['vm_id']} 持有 {addr}，但最新快照未报告该占用",
+            })
+
+    return {
+        "snapshot_seq": seq,
+        "committed_at": _iso(meta["committed_at"]),
+        "summary": {
+            "entries": len(rows),
+            "distinct_addresses": len(occupiers),
+            "stale_lease_occupancy": len(stale),
+            "duplicate_occupancy": len(duplicate),
+            "unexpected_occupancy": len(unexpected),
+            "consistent": len(consistent),
+            "missing_from_snapshot": len(missing),
+        },
+        "stale_lease_occupancy": stale,
+        "duplicate_occupancy": duplicate,
+        "unexpected_occupancy": unexpected,
+        "consistent": consistent,
+        "missing_from_snapshot": missing,
+    }
 
 
 # ---------------- 租约操作 ----------------
@@ -253,10 +471,22 @@ def apply_lease(body: ApplyIn):
                 busy = {r["address"] for r in conn.execute(
                     "SELECT address FROM leases WHERE released_at IS NULL AND expires_at > ?",
                     (now,)).fetchall()}
-                free = [a for a in POOL_ADDRESSES if a not in busy]
+                # 快照即事实：最新已提交快照中仍显示占用的地址（含已过期/已释放但未确认空闲的）
+                # 一律不得再次分配，直到更新的快照确认其空闲。
+                latest_seq = conn.execute("SELECT MAX(seq) FROM snapshots").fetchone()[0]
+                snapshot_held: set[str] = set()
+                if latest_seq is not None:
+                    snapshot_held = {r["address"] for r in conn.execute(
+                        "SELECT DISTINCT address FROM snapshot_entries WHERE seq = ?",
+                        (latest_seq,)).fetchall()}
+                blocked = busy | snapshot_held
+                free = [a for a in POOL_ADDRESSES if a not in blocked]
                 if not free:
                     _log_request(conn, body, "rejected_pool_exhausted", None, "地址不足")
-                    outcome = ("error", _conflict("pool_exhausted", "地址不足：地址池已耗尽，请稍后重试"))
+                    outcome = ("error", _conflict(
+                        "pool_exhausted",
+                        "地址不足：地址池已耗尽（含最新快照仍显示占用、尚未确认空闲的地址），"
+                        "请稍后重试或提交新快照释放占用"))
                 else:
                     address = free[0]
                     lease_id = uuid.uuid4().hex
@@ -335,6 +565,145 @@ def release_lease(lease_id: str, body: ReleaseIn):
     if kind == "error":
         raise payload
     return payload
+
+
+# ---------------- 快照对账 API ----------------
+
+@app.post("/api/snapshots", tags=["快照对账"], summary="提交网卡占用快照并返回对账结果",
+          status_code=201)
+def submit_snapshot(body: SnapshotIn):
+    """提交整份网卡占用快照（递增序号 + 全量占用列表），返回与当前租约台账的对账结果。
+
+    - 序号须严格递增：迟到的旧序号返回 409 `snapshot_seq_stale`，不改动现有快照；
+    - 同序号同内容重试：幂等返回 200（`replayed=true`），不重复写入、不推进序号；
+    - 同序号不同内容：返回 409 `snapshot_seq_conflict`，拒绝更新；
+    - 新序号在单个 BEGIN IMMEDIATE 事务内整份写入，任何失败都回滚，上一份完整快照原样保留；
+    - 对账只读租约台账，不会改写任何租约。
+    """
+    now = time.time()
+    pairs = _canonical_entries(body.entries)
+    digest = _content_hash(pairs)
+    with write_tx() as conn:
+        meta = _latest_snapshot_meta(conn)
+        current_seq = meta["seq"] if meta is not None else None
+        if current_seq is not None and body.seq < current_seq:
+            outcome: tuple[str, Any] = ("error", _conflict(
+                "snapshot_seq_stale",
+                f"快照序号 {body.seq} 已过期：当前已提交序号为 {current_seq}，迟到快照已拒绝",
+                current_seq=current_seq, submitted_seq=body.seq))
+        elif current_seq is not None and body.seq == current_seq:
+            if meta["content_hash"] != digest:
+                outcome = ("error", _conflict(
+                    "snapshot_seq_conflict",
+                    f"序号 {body.seq} 已存在但占用列表内容不同：冲突提交已拒绝，"
+                    "原快照保持不变（同序号仅允许相同内容的幂等重试）",
+                    current_seq=current_seq))
+            else:
+                rows = conn.execute(
+                    "SELECT vm_id, address FROM snapshot_entries WHERE seq = ? ORDER BY ord",
+                    (current_seq,)).fetchall()
+                report = _reconcile(conn, now)
+                outcome = ("ok", JSONResponse(status_code=200, content={
+                    "replayed": True,
+                    "message": "相同序号与相同内容的快照已提交过，幂等返回（不重复写入）",
+                    "snapshot_seq": current_seq,
+                    "committed_at": _iso(meta["committed_at"]),
+                    "entries": [{"vm_id": r["vm_id"], "address": r["address"]} for r in rows],
+                    "reconciliation": report,
+                }))
+        else:
+            conn.execute(
+                "INSERT INTO snapshots (seq, content_hash, entry_count, committed_at, committed_node)"
+                " VALUES (?,?,?,?,?)",
+                (body.seq, digest, len(pairs), now, INSTANCE_ID))
+            conn.executemany(
+                "INSERT INTO snapshot_entries (seq, vm_id, address, ord) VALUES (?,?,?,?)",
+                [(body.seq, vm, addr, i) for i, (vm, addr) in enumerate(pairs)])
+            report = _reconcile(conn, now)
+            outcome = ("ok", JSONResponse(status_code=201, content={
+                "replayed": False,
+                "message": f"快照 #{body.seq} 提交成功（{len(pairs)} 条占用），对账结果如下",
+                "snapshot_seq": body.seq,
+                "committed_at": _iso(now),
+                "entries": [{"vm_id": vm, "address": addr} for vm, addr in pairs],
+                "reconciliation": report,
+            }))
+    kind, payload = outcome
+    if kind == "error":
+        raise payload
+    return payload
+
+
+@app.get("/api/snapshots/latest", tags=["快照对账"], summary="最新已提交快照及其对账结果")
+def get_latest_snapshot():
+    """返回最后成功提交的快照（重启后仍可读取），并基于当前台账重新计算对账结果。"""
+    now = time.time()
+    with read_conn() as conn:
+        meta = _latest_snapshot_meta(conn)
+        if meta is None:
+            raise _error(404, "snapshot_not_found", "尚未提交任何网卡占用快照")
+        rows = conn.execute(
+            "SELECT vm_id, address FROM snapshot_entries WHERE seq = ? ORDER BY ord",
+            (meta["seq"],)).fetchall()
+        report = _reconcile(conn, now)
+    return {
+        "snapshot_seq": meta["seq"],
+        "content_hash": meta["content_hash"],
+        "entry_count": meta["entry_count"],
+        "committed_at": _iso(meta["committed_at"]),
+        "committed_node": meta["committed_node"],
+        "entries": [{"vm_id": r["vm_id"], "address": r["address"]} for r in rows],
+        "reconciliation": report,
+    }
+
+
+@app.get("/api/snapshots/reconcile", tags=["快照对账"], summary="仅对账：最新快照 vs 当前租约台账")
+def get_reconciliation():
+    """不提交快照，只输出最新已提交快照与当前租约台账的对账结果（台账实时状态，含懒过期）。"""
+    with read_conn() as conn:
+        if _latest_snapshot_meta(conn) is None:
+            raise _error(404, "snapshot_not_found", "尚未提交任何网卡占用快照")
+        return _reconcile(conn)
+
+
+@app.get("/api/snapshots/{seq}", tags=["快照对账"], summary="按序号查询历史快照（审计）")
+def get_snapshot(seq: int):
+    with read_conn() as conn:
+        meta = conn.execute("SELECT * FROM snapshots WHERE seq = ?", (seq,)).fetchone()
+        if meta is None:
+            latest = _latest_snapshot_meta(conn)
+            raise _error(404, "snapshot_not_found",
+                         f"快照 #{seq} 不存在",
+                         current_seq=latest["seq"] if latest is not None else None)
+        rows = conn.execute(
+            "SELECT vm_id, address FROM snapshot_entries WHERE seq = ? ORDER BY ord",
+            (seq,)).fetchall()
+    return {
+        "snapshot_seq": meta["seq"],
+        "content_hash": meta["content_hash"],
+        "entry_count": meta["entry_count"],
+        "committed_at": _iso(meta["committed_at"]),
+        "committed_node": meta["committed_node"],
+        "entries": [{"vm_id": r["vm_id"], "address": r["address"]} for r in rows],
+    }
+
+
+@app.get("/api/snapshots", tags=["快照对账"], summary="已提交快照序号列表（审计）")
+def list_snapshots(limit: int = Query(default=50, ge=1, le=500)):
+    with read_conn() as conn:
+        rows = conn.execute(
+            "SELECT seq, content_hash, entry_count, committed_at, committed_node"
+            " FROM snapshots ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
+    return {
+        "count": len(rows),
+        "snapshots": [{
+            "seq": r["seq"],
+            "content_hash": r["content_hash"],
+            "entry_count": r["entry_count"],
+            "committed_at": _iso(r["committed_at"]),
+            "committed_node": r["committed_node"],
+        } for r in rows],
+    }
 
 
 # ---------------- 查询 ----------------
@@ -421,23 +790,45 @@ def pool_status():
     with read_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM leases WHERE released_at IS NULL AND expires_at > ?", (now,)).fetchall()
+        latest_seq = conn.execute("SELECT MAX(seq) FROM snapshots").fetchone()[0]
+        snap_rows = []
+        if latest_seq is not None:
+            snap_rows = conn.execute(
+                "SELECT address, vm_id FROM snapshot_entries WHERE seq = ?", (latest_seq,)).fetchall()
     active = {r["address"]: r for r in rows}
+    # 同一地址可能被多机占用，快照视角保留全部占用虚拟机
+    snapshot_map: dict[str, list[str]] = {}
+    for r in snap_rows:
+        snapshot_map.setdefault(r["address"], []).append(r["vm_id"])
     addresses = []
     for addr in POOL_ADDRESSES:
         r = active.get(addr)
+        snap_vms = snapshot_map.get(addr, [])
+        if r is not None:
+            state = "leased"
+        elif snap_vms:
+            # 无有效租约但最新快照仍显示占用：不可再分配，直到新快照确认空闲
+            state = "snapshot-held"
+        else:
+            state = "free"
         addresses.append({
             "address": addr,
-            "state": "leased" if r is not None else "free",
+            "state": state,
             "vm_id": r["vm_id"] if r is not None else None,
             "lease_id": r["lease_id"] if r is not None else None,
             "expires_at": _iso(r["expires_at"]) if r is not None else None,
+            "snapshot_occupants": snap_vms,
+            "snapshot_seq": latest_seq if snap_vms else None,
         })
     leased = sum(1 for a in addresses if a["state"] == "leased")
+    held = sum(1 for a in addresses if a["state"] == "snapshot-held")
     return {
         "pool_cidr": POOL_CIDR,
         "total": len(addresses),
         "leased": leased,
-        "free": len(addresses) - leased,
+        "snapshot_held": held,
+        "free": len(addresses) - leased - held,
+        "latest_snapshot_seq": latest_seq,
         "addresses": addresses,
     }
 
@@ -470,4 +861,6 @@ def admin_reset():
     with write_tx() as conn:
         conn.execute("DELETE FROM leases")
         conn.execute("DELETE FROM request_log")
-    return {"message": "已清空全部租约与申请记录", "node": INSTANCE_ID}
+        conn.execute("DELETE FROM snapshot_entries")
+        conn.execute("DELETE FROM snapshots")
+    return {"message": "已清空全部租约、申请记录与网卡占用快照", "node": INSTANCE_ID}

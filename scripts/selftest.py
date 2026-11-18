@@ -3,7 +3,8 @@
 
 覆盖：申请 / 同号幂等重试（跨实例）/ 一机一址 / 池满“地址不足” / 续租（含错误令牌）/
 释放（幂等）/ 过期后旧号重试与旧令牌迟到操作 / 地址回收再分配 /
-双实例争抢最后一个地址 / 双实例满池争抢 / 申请记录审计。
+双实例争抢最后一个地址 / 双实例满池争抢 / 申请记录审计 /
+网卡占用快照对账（幂等/冲突/旧序号、占用阻断再分配、对账三类差异、快照与申请交错一致性）。
 
 前提：两个实例已启动且共享同一数据库，地址池为 10.99.0.0/29（6 个地址），ALLOW_RESET=1。
 用法：python3 scripts/selftest.py   （可用 BASE1/BASE2 环境变量覆盖地址）
@@ -53,6 +54,14 @@ def req(method, base, path, body=None):
 def apply(base, vm, rq, ttl):
     return req("POST", base, "/api/leases",
                {"vm_id": vm, "request_id": rq, "ttl_seconds": ttl})
+
+
+def snapshot(base, seq, entries):
+    return req("POST", base, "/api/snapshots", {"seq": seq, "entries": entries})
+
+
+def reconcile(base):
+    return req("GET", base, "/api/snapshots/reconcile")[1]
 
 
 def pool(base):
@@ -246,10 +255,231 @@ def main():
     check("node2 视角：6 租 0 空闲", p.get("leased") == 6 and p.get("free") == 0,
           json.dumps(p, ensure_ascii=False))
 
+    # ================= 网卡占用快照对账 =================
+
+    print("-- S1 重置后提交首份快照（含正常占用 / 无租约占用 / 池外地址）")
+    req("POST", BASE1, "/api/admin/reset")
+    s, b, _ = apply(BASE1, "vm-a", "req-a", 60)
+    la = b["lease"]  # 10.99.0.1
+    s, b, _ = snapshot(BASE1, 1, [
+        {"vm_id": "vm-a", "address": "10.99.0.1"},   # 与有效租约一致
+        {"vm_id": "vm-z", "address": "10.99.0.2"},   # 台账无有效租约
+        {"vm_id": "vm-x", "address": "10.99.0.5"},
+        {"vm_id": "vm-y", "address": "10.99.0.5"},   # 同一地址多机占用
+    ])
+    check("快照提交成功(201)", s == 201 and b.get("replayed") is False and b.get("snapshot_seq") == 1,
+          f"{s} {b}")
+    rep = b.get("reconciliation", {})
+    check("对账：1 条一致占用", rep.get("summary", {}).get("consistent") == 1, json.dumps(rep, ensure_ascii=False))
+    check("对账：1 个地址多机占用(10.99.0.5)",
+          [d.get("address") for d in rep.get("duplicate_occupancy", [])] == ["10.99.0.5"]
+          and rep["duplicate_occupancy"][0]["occupying_vms"] == ["vm-x", "vm-y"],
+          json.dumps(rep.get("duplicate_occupancy"), ensure_ascii=False))
+    unexp = {(u["address"], u["vm_id"], u["reason"]) for u in rep.get("unexpected_occupancy", [])}
+    check("对账：无有效租约的占用被标 unexpected(no_active_lease)",
+          ("10.99.0.2", "vm-z", "no_active_lease") in unexp, json.dumps(rep.get("unexpected_occupancy"), ensure_ascii=False))
+    check("对账：多机占用同时按各占用方记入 unexpected",
+          ("10.99.0.5", "vm-x", "no_active_lease") in unexp
+          and ("10.99.0.5", "vm-y", "no_active_lease") in unexp, str(unexp))
+    s, b, _ = snapshot(BASE1, 1, [{"vm_id": "vm-bad", "address": "10.0.0.99"}])
+    check("池外地址被拒绝(422)，快照不写入", s == 422, f"{s} {b}")
+    s, b, _ = req("GET", BASE2, "/api/snapshots/latest")
+    check("node2 读到 node1 提交的快照 #1（共享库）",
+          s == 200 and b.get("snapshot_seq") == 1 and len(b.get("entries", [])) == 4, f"{s} {b}")
+
+    print("-- S2 同序号幂等 / 冲突 / 迟到旧序号")
+    s, b, _ = snapshot(BASE2, 1, [
+        {"vm_id": "vm-a", "address": "10.99.0.1"},
+        {"vm_id": "vm-z", "address": "10.99.0.2"},
+        {"vm_id": "vm-x", "address": "10.99.0.5"},
+        {"vm_id": "vm-y", "address": "10.99.0.5"},
+    ])
+    check("同序号同内容重试：200 replayed 不重复写入",
+          s == 200 and b.get("replayed") is True, f"{s} {b}")
+    snaps = req("GET", BASE1, "/api/snapshots")[1]
+    check("快照列表仍只有 1 份", snaps.get("count") == 1, json.dumps(snaps))
+    s, b, _ = snapshot(BASE1, 1, [{"vm_id": "vm-a", "address": "10.99.0.1"}])
+    check("同序号不同内容：409 snapshot_seq_conflict",
+          s == 409 and b.get("detail", {}).get("error") == "snapshot_seq_conflict", f"{s} {b}")
+    s, b, _ = req("GET", BASE2, "/api/snapshots/latest")
+    check("冲突后原快照完整保留（仍为 4 条）",
+          b.get("snapshot_seq") == 1 and len(b.get("entries", [])) == 4, f"{s} {len(b.get('entries', []))}")
+    s, b, _ = snapshot(BASE1, 0, [])
+    check("序号 0 被参数校验拒绝(422)", s == 422, f"{s} {b}")
+
+    print("-- S3 快照占用阻断再分配（过期/释放地址未确认空闲前不得分配）")
+    # vm-z 占用的 10.99.0.2 从无租约；vm-a 释放 10.99.0.1 后它仍在快照中
+    s, b, _ = req("POST", BASE2, f"/api/leases/{la['lease_id']}/release", {"token": la["token"]})
+    check("释放 vm-a 的租约", s == 200 and b["lease"]["status"] == "released", f"{s} {b}")
+    p = pool(BASE1)
+    held = {a["address"]: a["state"] for a in p["addresses"]}
+    check("池总览：10.99.0.1/2/5 为 snapshot-held，其余 free",
+          held.get("10.99.0.1") == "snapshot-held" and held.get("10.99.0.2") == "snapshot-held"
+          and held.get("10.99.0.5") == "snapshot-held" and held.get("10.99.0.3") == "free"
+          and p.get("free") == 3 and p.get("snapshot_held") == 3, json.dumps(p, ensure_ascii=False))
+    s, b, _ = apply(BASE2, "vm-new1", "req-new1", 60)
+    check("新申请跳过快照占用地址，分到首个确认空闲的 10.99.0.3",
+          s == 201 and b["lease"]["address"] == "10.99.0.3", f"{s} {b}")
+    s, b, _ = apply(BASE1, "vm-new2", "req-new2", 60)
+    check("继续分配 10.99.0.4", s == 201 and b["lease"]["address"] == "10.99.0.4", f"{s} {b}")
+    s, b, _ = apply(BASE2, "vm-new3", "req-new3", 60)
+    check("再分配 10.99.0.6", s == 201 and b["lease"]["address"] == "10.99.0.6", f"{s} {b}")
+    s, b, _ = apply(BASE1, "vm-new4", "req-new4", 60)
+    check("三个确认空闲地址用完后：409 pool_exhausted（快照占用未释放）",
+          s == 409 and b["detail"]["error"] == "pool_exhausted", f"{s} {b}")
+
+    print("-- S4 对账：释放后仍占用 -> stale_lease_occupancy；归属不符 -> vm_mismatch")
+    rep = reconcile(BASE1)
+    stale = {(d["address"], d["vm_id"], d["ended_reason"]) for d in rep.get("stale_lease_occupancy", [])}
+    check("vm-a 释放后仍在快照占用 10.99.0.1 -> stale(released)",
+          ("10.99.0.1", "vm-a", "released") in stale, json.dumps(rep.get("stale_lease_occupancy"), ensure_ascii=False))
+    # 新快照：10.99.0.3 实际归 vm-new1，快照却报 vm-wrong；并确认 10.99.0.1 已空闲
+    s, b, _ = snapshot(BASE2, 2, [
+        {"vm_id": "vm-wrong", "address": "10.99.0.3"},
+        {"vm_id": "vm-z", "address": "10.99.0.2"},
+    ])
+    check("快照 #2 提交（序号推进，迟到的 #1 之后应被拒）",
+          s == 201 and b["snapshot_seq"] == 2, f"{s} {b}")
+    s, b, _ = snapshot(BASE1, 1, [{"vm_id": "vm-a", "address": "10.99.0.1"}])
+    check("迟到旧序号 #1：409 snapshot_seq_stale",
+          s == 409 and b["detail"]["error"] == "snapshot_seq_stale"
+          and b["detail"].get("current_seq") == 2, f"{s} {b}")
+    rep = req("GET", BASE1, "/api/snapshots/reconcile")[1]
+    mm = [u for u in rep.get("unexpected_occupancy", []) if u.get("reason") == "vm_mismatch"]
+    check("对账：10.99.0.3 归属不符 -> vm_mismatch（有效租约归 vm-new1）",
+          len(mm) == 1 and mm[0]["address"] == "10.99.0.3" and mm[0]["vm_id"] == "vm-wrong"
+          and mm[0]["active_lease"]["vm_id"] == "vm-new1", json.dumps(mm, ensure_ascii=False))
+    check("对账：10.99.0.2 仍为无有效租约占用",
+          any(u["address"] == "10.99.0.2" and u["reason"] == "no_active_lease"
+              for u in rep["unexpected_occupancy"]), json.dumps(rep["unexpected_occupancy"], ensure_ascii=False))
+    check("对账：有效租约 vm-new2/vm-new3 未出现在快照 -> missing_from_snapshot",
+          {m["address"] for m in rep["missing_from_snapshot"]} == {"10.99.0.4", "10.99.0.6"},
+          json.dumps(rep["missing_from_snapshot"], ensure_ascii=False))
+    check("对账不改写台账：vm-new1 的租约仍 active 且归属不变",
+          req("GET", BASE2, "/api/addresses/10.99.0.3")[1]["current_holder"]["vm_id"] == "vm-new1", "")
+
+    print("-- S5 新快照确认空闲后地址恢复可分配")
+    s, b, _ = snapshot(BASE1, 3, [
+        {"vm_id": "vm-z", "address": "10.99.0.2"},  # 仅保留这一处占用
+    ])
+    check("快照 #3 确认 10.99.0.1/10.99.0.3 空闲", s == 201, f"{s} {b}")
+    p = pool(BASE2)
+    # 此时 vm-new1/new2/new3 的 3 条有效租约仍在（.3/.4/.6），.2 仍被快照占用，真正空闲为 .1/.5
+    check("池总览：leased=3、snapshot_held=1、free=2",
+          p.get("leased") == 3 and p.get("snapshot_held") == 1 and p.get("free") == 2,
+          json.dumps(p, ensure_ascii=False))
+    s, b, _ = apply(BASE2, "vm-reuse", "req-reuse", 60)
+    check("恢复后新申请可拿到 10.99.0.1（最低空闲）",
+          s == 201 and b["lease"]["address"] == "10.99.0.1", f"{s} {b}")
+
+    print("-- S6 快照与申请交错：分配与对账基于一致的已提交状态（双实例并发）")
+
+    # 场景 A（确定性）：快照先占用 .1，并发申请只可分 .2~.6；
+    # 再让“新快照追加占用 .2”与 3 个申请并发，用可串行化不变量核对结果。
+    req("POST", BASE1, "/api/admin/reset")
+    s, _, _ = snapshot(BASE1, 1, [{"vm_id": "vm-hold", "address": "10.99.0.1"}])
+    check("交错 A：预置快照 #1 占用 10.99.0.1", s == 201, f"{s}")
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [
+            ex.submit(snapshot, BASE2, 2, [
+                {"vm_id": "vm-hold", "address": "10.99.0.1"},
+                {"vm_id": "vm-hold2", "address": "10.99.0.2"},
+            ]),
+            ex.submit(apply, BASE1, "vm-t1", "req-t1", 60),
+            ex.submit(apply, BASE2, "vm-t2", "req-t2", 60),
+            ex.submit(apply, BASE1, "vm-t3", "req-t3", 60),
+        ]
+        results = [f.result() for f in futs]
+    check("交错 A：快照 #2 提交成功", results[0][0] == 201 and results[0][1]["snapshot_seq"] == 2,
+          f"{results[0][0]} {results[0][1]}")
+    won = [r for r in results[1:] if r[0] == 201]
+    got = sorted(r[1]["lease"]["address"] for r in won)
+    check("交错 A：3 个申请全部成功（池内足够）", len(won) == 3, str(got))
+    check("交错 A：预置快照 #1 的 10.99.0.1 绝不可能被分走",
+          "10.99.0.1" not in got, str(got))
+    check("交错 A：分配地址互不重复", len(set(got)) == len(got), str(got))
+    # 可串行化不变量：写事务在 SQLite 层串行化，只存在两种合法历史——
+    #  (1) 快照 #2 先提交：.2 被阻断，任何租约都拿不到 .2；
+    #  (2) 某申请先提交拿到 .2：最终状态与快照 #2 不符，对账必须如实报 vm_mismatch。
+    # 两种历史都要求“分配与对账依据同一份已提交状态”，不允许出现分配了却对不出来的情形。
+    rep = reconcile(BASE1)
+    flagged = {(u["address"], u["reason"]) for u in rep.get("unexpected_occupancy", [])}
+    lease_2 = req("GET", BASE1, "/api/addresses/10.99.0.2")[1]
+    if lease_2["state"] == "leased":
+        check("交错 A：.2 已出租（申请事务先于快照提交）-> 对账必须报 vm_mismatch",
+              ("10.99.0.2", "vm_mismatch") in flagged
+              and next(u for u in rep["unexpected_occupancy"] if u["address"] == "10.99.0.2"
+                       )["active_lease"]["lease_id"] == lease_2["current_holder"]["lease_id"],
+              json.dumps(rep.get("unexpected_occupancy"), ensure_ascii=False))
+    else:
+        check("交错 A：快照 #2 先提交，.2 被阻断无租约", True)
+
+    # 场景 B（确定性）：先提交占满 6 地址的快照，再并发 6 个申请 -> 必然全部 pool_exhausted
+    req("POST", BASE2, "/api/admin/reset")
+    full = [{"vm_id": f"vm-h{i}", "address": f"10.99.0.{i}"} for i in range(1, 7)]
+    s, b, _ = snapshot(BASE1, 1, full)
+    check("交错 B：满占用快照 #1 提交成功", s == 201, f"{s} {b}")
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        app_r = list(ex.map(lambda i: apply(BASE2 if i % 2 else BASE1,
+                                            f"vm-b{i}", f"req-b{i}", 60), range(6)))
+    check("交错 B：6 个并发申请全部 409 pool_exhausted（快照占满，无地址可分）",
+          all(r[0] == 409 and r[1]["detail"]["error"] == "pool_exhausted" for r in app_r),
+          str([(r[0], r[1].get("detail", {}).get("error")) for r in app_r]))
+    check("交错 B：台账无任何租约（快照不产生租约、不改写台账）",
+          req("GET", BASE1, "/api/leases?limit=100")[1]["count"] == 0, "")
+    # 新快照确认全部空闲后立即恢复可分配
+    s, _, _ = snapshot(BASE2, 2, [])
+    check("交错 B：空快照 #2 确认全部空闲", s == 201, f"{s}")
+    s, b, _ = apply(BASE1, "vm-back", "req-back", 60)
+    check("交错 B：确认空闲后立刻可申请到 10.99.0.1",
+          s == 201 and b["lease"]["address"] == "10.99.0.1", f"{s} {b}")
+
+    # 场景 C（不变量压测）：多轮“快照提交 + 并发申请”交错。
+    # 每轮结束后，对快照占用地址只允许两种一致状态：
+    #  (1) 无有效租约（快照先提交，地址被阻断）；
+    #  (2) 有有效租约但归属虚拟机与快照不同（申请事务先提交），此时对账必须报 vm_mismatch。
+    req("POST", BASE1, "/api/admin/reset")
+    violations = []
+    for rnd in range(8):
+        base_seq = rnd * 10 + 1
+        held_addr = f"10.99.0.{(rnd % 6) + 1}"
+        holder_vm = f"vm-h{rnd}"
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            f_snap = ex.submit(snapshot, BASE1 if rnd % 2 else BASE2, base_seq,
+                               [{"vm_id": holder_vm, "address": held_addr}])
+            f_apps = [ex.submit(apply, BASE1 if i % 2 else BASE2,
+                                f"vm-r{rnd}-{i}", f"req-r{rnd}-{i}", 60) for i in range(3)]
+            snap_r = f_snap.result()
+            apps = [f.result() for f in f_apps]
+        if snap_r[0] != 201:
+            violations.append(f"round{rnd}: snapshot failed {snap_r[0]}")
+            continue
+        # 注意：核对必须在“确认空闲的空快照”之前，基于本轮快照 base_seq 的已提交状态
+        rep = reconcile(BASE2)
+        mismatches = {(u["address"], u["vm_id"], u["reason"])
+                      for u in rep.get("unexpected_occupancy", [])}
+        addr_view = req("GET", BASE1, f"/api/addresses/{held_addr}")[1]
+        if addr_view["state"] == "free":
+            # 状态 (1)：快照先提交，地址被阻断；实现会以 no_active_lease 报告该占用。
+            if (held_addr, holder_vm, "no_active_lease") not in mismatches:
+                violations.append(f"round{rnd}: {held_addr} blocked but reconciliation missed report")
+        else:
+            holder = addr_view["current_holder"]
+            if holder["vm_id"] == holder_vm:
+                violations.append(f"round{rnd}: {held_addr} leased to snapshot VM without lease semantics")
+            elif (held_addr, holder_vm, "vm_mismatch") not in mismatches:
+                # 状态 (2)：申请先提交，对账必须把快照占用方与实际归属的不符如实报出
+                violations.append(f"round{rnd}: {held_addr} leased to {holder['vm_id']} "
+                                  "but reconciliation missed vm_mismatch")
+        # 下一轮先确认空闲，保证地址可回收、轮次之间互不干扰
+        snapshot(BASE2, base_seq + 1, [])
+    check("交错 C：8 轮并发交错全部满足一致性不变量（阻断或对账必报，二者必居其一）",
+          not violations, str(violations))
+
     print(f"\n== 结果: {passed} 通过, {failed} 失败")
     if failed:
         sys.exit(1)
-    print("== 全部通过。可接着做重启持久化核对（leases/request_log 存于共享 SQLite）。")
+    print("== 全部通过。可接着做重启持久化核对（leases/request_log/快照 存于共享 SQLite）。")
 
 
 if __name__ == "__main__":
